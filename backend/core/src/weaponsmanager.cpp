@@ -1,5 +1,5 @@
 #include "framework.h"
-#include "weaponsManager.h"
+#include "weaponsmanager.h"
 #include "logger.h"
 #include "weapon.h"
 #include "scheduler.h"

@@ -4,7 +4,7 @@
 #include "commands.h"
 #include "scheduler.h"
 #include "defines.h"
-#include "unitsManager.h"
+#include "unitsmanager.h"
 
 #include <GeographicLib/Geodesic.hpp>
 using namespace GeographicLib;
@@ -32,7 +32,7 @@ void AirUnit::setDefaults(bool force)
 	setROE(ROE::OPEN_FIRE_WEAPON_FREE, force);
 	setReactionToThreat(ReactionToThreat::EVADE_FIRE, force);
 	setEmissionsCountermeasures(EmissionCountermeasure::DEFEND, force);
-	strcpy_s(TACAN.callsign, 4, "TKR");
+	strncpy(TACAN.callsign, "TKR", 3); TACAN.callsign[3] = '\0';
 	setTACAN(TACAN, force);
 	setRadio(radio, force);
 	setGeneralSettings(generalSettings, force);

@@ -1254,7 +1254,7 @@ end
 function Olympus.setUnitsData(arg, time)
 	-- Units data
 	local units = {}
-	
+
 	local startIndex = Olympus.unitIndex
 	local endIndex = startIndex + Olympus.unitStep
 	local index = 0
@@ -1263,7 +1263,7 @@ function Olympus.setUnitsData(arg, time)
 		-- Only the indexes between startIndex and endIndex are handled. This is a simple way to spread the update load over many cycles
 		if index > startIndex then
 			if unit ~= nil and unit:isExist() then
-				local table = {}	
+				local table = {}
 
 				-- Get the object category in Olympus name
 				local objectCategory = Object.getCategory(unit)
@@ -1470,13 +1470,13 @@ function Olympus.setUnitsData(arg, time)
 		end
 	end
 
-	-- Reset the counter 
-	if index ~= endIndex then 
+	-- Reset the counter
+	if index ~= endIndex then
 		Olympus.unitIndex = 0
 	else
 		Olympus.unitIndex = endIndex
 	end
-	
+
 	-- Assemble unitsData table
 	Olympus.unitsData["units"] = units
 
@@ -1662,7 +1662,7 @@ function Olympus.setMissionData(arg, time)
 end
 
 -- Initializes the units table with all the existing ME units
-function Olympus.initializeUnits() 
+function Olympus.initializeUnits()
 	if mist and mist.DBs and mist.DBs.MEunitsById then
 		for id, unitsTable in pairs(mist.DBs.MEunitsById) do
 			local unit = Unit.getByName(unitsTable["unitName"])
@@ -1670,7 +1670,23 @@ function Olympus.initializeUnits()
 				Olympus.units[unit["id_"]] = unit
 			end
 		end
-		Olympus.notify("Olympus units table initialized", 2)
+		-- Also enumerate all live coalition groups to catch dynamically spawned
+		-- units (e.g. from DCS Retribution) whose birth events fired before this
+		-- script registered its event handler.
+		local coalitionUnitCount = 0
+		for _, side in ipairs({coalition.side.RED, coalition.side.BLUE, coalition.side.NEUTRAL}) do
+			local groups = coalition.getGroups(side)
+			Olympus.notify("coalition.getGroups side="..tostring(side).." returned "..tostring(#groups).." groups", 2)
+			for _, group in ipairs(groups) do
+				for _, unit in ipairs(group:getUnits()) do
+					if unit ~= nil and unit:isExist() then
+						Olympus.units[unit["id_"]] = unit
+						coalitionUnitCount = coalitionUnitCount + 1
+					end
+				end
+			end
+		end
+		Olympus.notify("Olympus units table initialized: ME="..tostring(#mist.DBs.MEunitsById or {}).." coalition="..tostring(coalitionUnitCount), 2)
 	else
 		Olympus.debug("MIST DBs not ready", 2)
 		timer.scheduleFunction(Olympus.initializeUnits, {}, timer.getTime() + 1)

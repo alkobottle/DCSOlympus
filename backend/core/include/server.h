@@ -2,8 +2,12 @@
 #include "framework.h"
 #include "luatools.h"
 
-using namespace web::http;
-using namespace web::http::experimental::listener;
+// Forward declarations — full definition only needed in server.cpp
+namespace httplib {
+    struct Request;
+    struct Response;
+    class Server;
+}
 
 class UnitsManager;
 class Scheduler;
@@ -11,25 +15,25 @@ class Scheduler;
 class Server
 {
 public:
-	Server(lua_State* L);
+    Server(lua_State* L);
 
     void start(lua_State* L);
     void stop(lua_State* L);
 
 private:
-	std::thread* serverThread;
+    std::thread* serverThread;
 
-    void handle_options(http_request request);
-    void handle_get(http_request request);
-    void handle_request(http_request request, function<void(json::value const&, json::value&)> action);
-    void handle_put(http_request request);
+    void handle_options(const httplib::Request& req, httplib::Response& res);
+    void handle_get(const httplib::Request& req, httplib::Response& res);
+    void handle_put(const httplib::Request& req, httplib::Response& res);
 
-    string extractUsername(http_request& request);
-    string extractPassword(http_request& request);
+    string extractUsername(const httplib::Request& req);
+    string extractPassword(const httplib::Request& req);
 
     void task();
 
     atomic<bool> runListener;
+    atomic<httplib::Server*> svr_ptr{nullptr};
 
     string gameMasterPassword = "";
     string blueCommanderPassword = "";
@@ -37,4 +41,3 @@ private:
     string atcPassword = "";
     string observerPassword = "";
 };
-

@@ -41,6 +41,10 @@ do
 				else
 					log.write('Olympus.HOOKS.LUA', log.ERROR, 'Failed to load '..OlympusName)
 				end
+				-- Force-resume the simulation so mission timers fire without requiring clients.
+				-- DCS dedicated servers start in ssPaused regardless of pause_on_load setting.
+				DCS.setPause(false)
+				log.write('Olympus.HOOKS.LUA', log.INFO, 'Forced simulation resume (DCS.setPause(false))')
 			end
 		end
 		

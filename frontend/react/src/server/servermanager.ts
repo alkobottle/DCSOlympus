@@ -121,7 +121,9 @@ export class ServerManager {
     xmlHttp.open("GET", `${this.#REST_ADDRESS}/${uri}${optionsString ? `?${optionsString}` : ""}`, true);
 
     /* If provided, set the credentials */
-    xmlHttp.setRequestHeader("Authorization", "Basic " + btoa(`${this.#username ?? ""}:${this.#password ?? ""}`));
+    if (!getApp().getConfig()?.frontend?.customAuthHeaders?.enabled) {
+      xmlHttp.setRequestHeader("Authorization", "Basic " + btoa(`${this.#username ?? ""}:${this.#password ?? ""}`));
+    }
     xmlHttp.setRequestHeader("X-Command-Mode", this.#activeCommandMode);
     xmlHttp.timeout = 2000;
 
@@ -176,7 +178,9 @@ export class ServerManager {
     var xmlHttp = new XMLHttpRequest();
     xmlHttp.open("PUT", this.#REST_ADDRESS);
     xmlHttp.setRequestHeader("Content-Type", "application/json");
-    xmlHttp.setRequestHeader("Authorization", "Basic " + btoa(`${this.#username ?? ""}:${this.#password ?? ""}`));
+    if (!getApp().getConfig()?.frontend?.customAuthHeaders?.enabled) {
+      xmlHttp.setRequestHeader("Authorization", "Basic " + btoa(`${this.#username ?? ""}:${this.#password ?? ""}`));
+    }
     xmlHttp.setRequestHeader("X-Command-Mode", this.#activeCommandMode);
     xmlHttp.onload = (res: any) => {
       var res = JSON.parse(xmlHttp.responseText);

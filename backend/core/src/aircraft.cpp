@@ -4,7 +4,7 @@
 #include "commands.h"
 #include "scheduler.h"
 #include "defines.h"
-#include "unitsManager.h"
+#include "unitsmanager.h"
 
 #include <GeographicLib/Geodesic.hpp>
 using namespace GeographicLib;

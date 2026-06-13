@@ -1,7 +1,7 @@
 #include "scheduler.h"
 #include "logger.h"
 #include "dcstools.h"
-#include "unitsManager.h"
+#include "unitsmanager.h"
 #include "utils.h"
 #include "unit.h"
 
@@ -524,7 +524,7 @@ void Scheduler::handleRequest(string key, json::value value, string username, js
 			string callsign = to_string(value[L"TACAN"][L"callsign"]);
 			if (callsign.length() > 3)
 				callsign = callsign.substr(0, 3);
-			strcpy_s(TACAN.callsign, 4, callsign.c_str());
+			strncpy(TACAN.callsign, callsign.c_str(), 3); TACAN.callsign[3] = '\0';
 			unit->setTACAN(TACAN);
 
 			/* Radio Options */

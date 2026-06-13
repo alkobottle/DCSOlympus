@@ -1,11 +1,11 @@
 #include "dcstools.h"
 #include "logger.h"
 #include "defines.h"
-#include "unitsManager.h"
-#include "weaponsManager.h"
+#include "unitsmanager.h"
+#include "weaponsmanager.h"
 #include "server.h"
 #include "scheduler.h"
-#include "scriptLoader.h"
+#include "scriptloader.h"
 #include "luatools.h"
 #include <chrono>
 using namespace std::chrono;

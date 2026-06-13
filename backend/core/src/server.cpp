@@ -1,19 +1,24 @@
 #include "server.h"
 #include "logger.h"
 #include "defines.h"
-#include "unitsManager.h"
-#include "weaponsManager.h"
+#include "unitsmanager.h"
+#include "weaponsmanager.h"
 #include "scheduler.h"
 #include "luatools.h"
-#include <exception>
-#include <stdexcept>
 #include "base64.hpp"
 
+#include <httplib.h>
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include <exception>
+#include <stdexcept>
+#include <algorithm>
+
 using namespace std::chrono;
 using namespace base64;
 
-extern UnitsManager* unitsManager; 
+extern UnitsManager* unitsManager;
 extern WeaponsManager* weaponsManager;
 extern Scheduler* scheduler;
 extern json::value missionData;
@@ -23,23 +28,19 @@ extern mutex mutexLock;
 extern string sessionHash;
 extern string instancePath;
 
-void handle_eptr(std::exception_ptr eptr)
+static void set_cors_headers(httplib::Response& res)
 {
-    try {
-        if (eptr) {
-            std::rethrow_exception(eptr);
-        }
-    }
-    catch (const std::exception& e) {
-        log(e.what());
-    }
+    res.set_header("Allow", "GET, PUT, OPTIONS");
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-Server::Server(lua_State* L):
+Server::Server(lua_State* L) :
     serverThread(nullptr),
-    runListener(true)
+    runListener(true),
+    svr_ptr(nullptr)
 {
-
 }
 
 void Server::start(lua_State* L)
@@ -52,310 +53,252 @@ void Server::stop(lua_State* L)
 {
     log("Stopping RESTServer");
     runListener = false;
-    if (serverThread != nullptr)
+    httplib::Server* s = svr_ptr.load();
+    if (s) s->stop();
+    if (serverThread != nullptr) {
         serverThread->join();
+        delete serverThread;
+        serverThread = nullptr;
+    }
 }
 
-void Server::handle_options(http_request request)
+void Server::handle_options(const httplib::Request& req, httplib::Response& res)
 {
-    http_response response(status_codes::OK);
-    response.headers().add(U("Allow"), U("GET, PUT, OPTIONS"));
-    response.headers().add(U("Access-Control-Allow-Origin"), U("*"));
-    response.headers().add(U("Access-Control-Allow-Methods"), U("GET, PUT, OPTIONS"));
-    response.headers().add(U("Access-Control-Allow-Headers"), U("Content-Type, Authorization"));
-
-    request.reply(response);
+    res.status = 200;
+    set_cors_headers(res);
 }
 
-void Server::handle_get(http_request request)
+void Server::handle_get(const httplib::Request& req, httplib::Response& res)
 {
-    /* Lock for thread safety */
     lock_guard<mutex> guard(mutexLock);
 
     milliseconds ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
-    http_response response(status_codes::OK);
-    
-    string password = extractPassword(request);
-    if (password.compare(gameMasterPassword) == 0 || password.compare(blueCommanderPassword) == 0 || password.compare(redCommanderPassword) == 0)
-    {
-        std::exception_ptr eptr;
-        try {
-            auto answer = json::value::object();
-            auto path = uri::split_path(uri::decode(request.relative_uri().path()));
 
-            /* If present, extract the request reference time. This is used for updates, and it specifies the last time that request has been performed */
-            map<utility::string_t, utility::string_t> query = request.relative_uri().split_query(request.relative_uri().query());
+    string password = extractPassword(req);
+    if (password == gameMasterPassword || password == blueCommanderPassword || password == redCommanderPassword)
+    {
+        try {
+            // Extract the resource name from the path: /olympus/<resource>
+            static const string prefix = "/olympus/";
+            string URI;
+            if (req.path.find(prefix) == 0)
+                URI = req.path.substr(prefix.size());
+
+            // Optional timestamp for delta updates
             unsigned long long time = 0;
-            if (query.find(L"time") != query.end())
-            {
-                try {
-                    time = stoull((*(query.find(L"time"))).second);
-                }
-                catch (...) {
-                    time = 0;
-                }
+            if (req.has_param("time")) {
+                try { time = stoull(req.get_param_value("time")); }
+                catch (...) { time = 0; }
             }
 
-            if (path.size() > 0)
+            if (!URI.empty())
             {
-                string URI = to_string(path[0]);
-                /* Units data */
-                if (URI.compare(UNITS_URI) == 0)
+                if (URI == UNITS_URI)
                 {
                     unsigned long long updateTime = ms.count();
                     stringstream ss;
                     ss.write((char*)&updateTime, sizeof(updateTime));
                     unitsManager->getUnitData(ss, time);
-                    response.set_body(concurrency::streams::bytestream::open_istream(ss.str()));
+                    res.set_content(ss.str(), "application/octet-stream");
                 }
-                else if (URI.compare(WEAPONS_URI) == 0)
+                else if (URI == WEAPONS_URI)
                 {
                     unsigned long long updateTime = ms.count();
                     stringstream ss;
                     ss.write((char*)&updateTime, sizeof(updateTime));
                     weaponsManager->getWeaponData(ss, time);
-                    response.set_body(concurrency::streams::bytestream::open_istream(ss.str()));
+                    res.set_content(ss.str(), "application/octet-stream");
                 }
                 else {
-                    /* Logs data */
-                    if (URI.compare(LOGS_URI) == 0)
+                    auto answer = json::value::object();
+
+                    if (URI == LOGS_URI)
                     {
                         auto logs = json::value::object();
-                        getLogsJSON(logs, time);   
+                        getLogsJSON(logs, time);
                         answer[L"logs"] = logs;
                     }
-                    /* Airbases data */
-                    else if (URI.compare(AIRBASES_URI) == 0 && missionData.has_object_field(L"airbases")) 
+                    else if (URI == AIRBASES_URI && missionData.has_object_field(L"airbases"))
                         answer[L"airbases"] = missionData[L"airbases"];
-                    /* Bullseyes data */
-                    else if (URI.compare(BULLSEYE_URI) == 0 && missionData.has_object_field(L"bullseyes")) 
+                    else if (URI == BULLSEYE_URI && missionData.has_object_field(L"bullseyes"))
                         answer[L"bullseyes"] = missionData[L"bullseyes"];
-                    /* Spots (laser/IR) data */
-                    else if (URI.compare(SPOTS_URI) == 0 && missionData.has_object_field(L"spots"))
+                    else if (URI == SPOTS_URI && missionData.has_object_field(L"spots"))
                         answer[L"spots"] = missionData[L"spots"];
-                    /* Markers data */
-                    else if (URI.compare(MARKERS_URI) == 0 && missionData.has_object_field(L"markers"))
+                    else if (URI == MARKERS_URI && missionData.has_object_field(L"markers"))
                         answer[L"markers"] = missionData[L"markers"];
-                    /* Mission data */
-                    else if (URI.compare(MISSION_URI) == 0 && missionData.has_object_field(L"mission")) {
+                    else if (URI == MISSION_URI && missionData.has_object_field(L"mission"))
+                    {
                         answer[L"mission"] = missionData[L"mission"];
                         answer[L"mission"][L"commandModeOptions"] = scheduler->getCommandModeOptions();
-
-                        /* The active mode is determined by the inserted password*/
-                        if (password.compare(gameMasterPassword) == 0)
+                        if (password == gameMasterPassword)
                             answer[L"mission"][L"commandModeOptions"][L"commandMode"] = json::value(L"Game master");
-                        else if (password.compare(blueCommanderPassword) == 0) 
+                        else if (password == blueCommanderPassword)
                             answer[L"mission"][L"commandModeOptions"][L"commandMode"] = json::value(L"Blue commander");
-                        else if (password.compare(redCommanderPassword) == 0)
-                            answer[L"mission"][L"commandModeOptions"][L"commandMode"] = json::value(L"Red commander");   
-                        else 
+                        else if (password == redCommanderPassword)
+                            answer[L"mission"][L"commandModeOptions"][L"commandMode"] = json::value(L"Red commander");
+                        else
                             answer[L"mission"][L"commandModeOptions"][L"commandMode"] = json::value(L"Observer");
                     }
-                    else if (URI.compare(COMMANDS_URI) == 0 && query.find(L"commandHash") != query.end()) {
-                        answer[L"commandExecuted"] = json::value(scheduler->isCommandExecuted(to_string(query[L"commandHash"])));
-                        if (executionResults.has_field(query[L"commandHash"]))
-                            answer[L"commandResult"] = executionResults[query[L"commandHash"]];
+                    else if (URI == COMMANDS_URI && req.has_param("commandHash"))
+                    {
+                        wstring wCommandHash = to_wstring(req.get_param_value("commandHash"));
+                        answer[L"commandExecuted"] = json::value(scheduler->isCommandExecuted(req.get_param_value("commandHash")));
+                        if (executionResults.has_field(wCommandHash))
+                            answer[L"commandResult"] = executionResults[wCommandHash];
                         else
-							answer[L"commandResult"] = json::value::null();
+                            answer[L"commandResult"] = json::value::null();
                     }
-                    /* Drawings data*/
-                    else if (URI.compare(DRAWINGS_URI) == 0 && drawingsByLayer.has_object_field(L"drawings")) {
+                    else if (URI == DRAWINGS_URI && drawingsByLayer.has_object_field(L"drawings"))
                         answer[L"drawings"] = drawingsByLayer[L"drawings"];
-                    }
-                    
-                    /* Common data */
-                    answer[L"time"] = json::value::string(to_wstring(ms.count()));
+
+                    answer[L"time"] = json::value::string(to_wstring(to_string(ms.count())));
                     answer[L"sessionHash"] = json::value::string(to_wstring(sessionHash));
                     answer[L"load"] = scheduler->getLoad();
                     answer[L"frameRate"] = scheduler->getFrameRate();
-                    response.set_body(answer);
+
+                    res.set_content(to_string(answer.serialize()), "application/json");
                 }
             }
         }
-        catch (...) {
-            eptr = std::current_exception(); // capture
+        catch (const exception& e) {
+            log(e.what());
+            res.status = 500;
         }
-        handle_eptr(eptr);
     }
     else {
-        response = status_codes::Unauthorized;
+        res.status = 401;
     }
 
-    response.headers().add(U("Allow"), U("GET, PUT, OPTIONS"));
-    response.headers().add(U("Access-Control-Allow-Origin"), U("*"));
-    response.headers().add(U("Access-Control-Allow-Methods"), U("GET, PUT, OPTIONS"));
-    response.headers().add(U("Access-Control-Allow-Headers"), U("Content-Type, Authorization"));
-    
-    request.reply(response);
+    set_cors_headers(res);
 }
 
-void Server::handle_request(http_request request, function<void(json::value const&, json::value&)> action)
+void Server::handle_put(const httplib::Request& req, httplib::Response& res)
 {
-    http_response response(status_codes::OK);
+    string username = extractUsername(req);
+    string password = extractPassword(req);
 
-    //TODO: limit what a user can do depending on the password
-    string password = extractPassword(request);
-    if (password.compare(gameMasterPassword) == 0 || password.compare(blueCommanderPassword) == 0 || password.compare(redCommanderPassword) == 0)
-    {
-        auto answer = json::value::object();
-        request.extract_json().then([&answer, &action](pplx::task<json::value> task)
-        {
-            try
-            {
-                auto const& jvalue = task.get();
-                if (!jvalue.is_null())
-                    action(jvalue, answer);
-            }
-            catch (http_exception const& e)
-            {
-                log(e.what());
-            }
-        }).wait();
-        response.set_body(answer);
-    }
-    else {
-        response = status_codes::Unauthorized;
+    if (password != gameMasterPassword && password != blueCommanderPassword && password != redCommanderPassword) {
+        res.status = 401;
+        set_cors_headers(res);
+        return;
     }
 
-    response.headers().add(U("Allow"), U("GET, PUT, OPTIONS"));
-    response.headers().add(U("Access-Control-Allow-Origin"), U("*"));
-    response.headers().add(U("Access-Control-Allow-Methods"), U("GET, PUT, OPTIONS"));
-    response.headers().add(U("Access-Control-Allow-Headers"), U("Content-Type, Authorization"));
-    
-    request.reply(response);
-}
+    auto answer = json::value::object();
 
-void Server::handle_put(http_request request)
-{
-    string username = extractUsername(request);
-    handle_request(
-    request,
-    [username](json::value const& jvalue, json::value& answer)
-    {
-        /* Lock for thread safety */
-        lock_guard<mutex> guard(mutexLock);
-
-        for (auto const& e : jvalue.as_object())
+    try {
+        error_code ec;
+        json::value jvalue = json::value::parse(req.body, ec);
+        if (!ec && !jvalue.is_null())
         {
-            auto key = e.first;
-            auto value = e.second;
-            
-            std::exception_ptr eptr;
-            try {
-                scheduler->handleRequest(to_string(key), value, username, answer);
+            lock_guard<mutex> guard(mutexLock);
+            for (auto const& e : jvalue.as_object())
+            {
+                try {
+                    scheduler->handleRequest(to_string(e.first), e.second, username, answer);
+                }
+                catch (const exception& e2) {
+                    log(e2.what());
+                }
             }
-            catch (...) {
-                eptr = std::current_exception(); // capture
-            }
-            handle_eptr(eptr);
         }
-    });    
+    }
+    catch (const exception& e) {
+        log(e.what());
+    }
+
+    res.set_content(to_string(answer.serialize()), "application/json");
+    set_cors_headers(res);
 }
 
-string Server::extractUsername(http_request& request) {
-    if (request.headers().has(L"Authorization")) {
-        string authorization = to_string(request.headers().find(L"Authorization")->second);
-        string s = "Basic ";
-        string::size_type i = authorization.find(s);
+string Server::extractUsername(const httplib::Request& req)
+{
+    if (!req.has_header("Authorization")) return "";
 
-        if (i != std::string::npos)
-            authorization.erase(i, s.length());
-        else
-            return "";
+    string authorization = req.get_header_value("Authorization");
+    const string s = "Basic ";
+    string::size_type i = authorization.find(s);
+    if (i == string::npos) return "";
+    authorization.erase(i, s.length());
 
-        string decoded = from_base64(authorization);
-        i = decoded.find(":");
-        if (i != string::npos && i <= decoded.length())
-            decoded.erase(i, decoded.length() - i);
-        else
-            return "";
-
-        return decoded;
-    }
-    else
-        return "";
+    string decoded = from_base64(authorization);
+    i = decoded.find(":");
+    if (i == string::npos || i >= decoded.length()) return "";
+    decoded.erase(i, decoded.length() - i);
+    return decoded;
 }
 
-string Server::extractPassword(http_request& request) {
-    if (request.headers().has(L"Authorization")) {
-        string authorization = to_string(request.headers().find(L"Authorization")->second);
-        string s = "Basic ";
-        string::size_type i = authorization.find(s);
+string Server::extractPassword(const httplib::Request& req)
+{
+    if (!req.has_header("Authorization")) return "";
 
-        if (i != std::string::npos)
-            authorization.erase(i, s.length());
-        else
-            return "";
+    string authorization = req.get_header_value("Authorization");
+    const string s = "Basic ";
+    string::size_type i = authorization.find(s);
+    if (i == string::npos) return "";
+    authorization.erase(i, s.length());
 
-        string decoded = from_base64(authorization);
-        i = decoded.find(":");
-        if (i != string::npos && i+1 < decoded.length())
-            decoded.erase(0, i+1);
-        else
-            return "";
-
-        return decoded;
-    }
-    else
-        return "";
+    string decoded = from_base64(authorization);
+    i = decoded.find(":");
+    if (i == string::npos || i + 1 >= decoded.length()) return "";
+    decoded.erase(0, i + 1);
+    return decoded;
 }
 
 void Server::task()
 {
-    string address = REST_ADDRESS;
+    string host = "localhost";
+    int port = 3001;
     string jsonLocation = instancePath + OLYMPUS_JSON_PATH;
 
     log("Reading configuration from " + jsonLocation);
 
-    std::ifstream ifstream(jsonLocation);
-    std::stringstream ss;
-    ss << ifstream.rdbuf();
-    std::error_code errorCode;
+    ifstream ifs(jsonLocation);
+    stringstream ss;
+    ss << ifs.rdbuf();
+    error_code errorCode;
     json::value config = json::value::parse(ss.str(), errorCode);
-    if (config.is_object() && config.has_object_field(L"backend") &&
-        config[L"backend"].has_string_field(L"address") && config[L"backend"].has_number_field(L"port"))
+
+    if (!errorCode && config.is_object() &&
+        config.has_object_field(L"backend") &&
+        config[L"backend"].has_string_field(L"address") &&
+        config[L"backend"].has_number_field(L"port"))
     {
-        address = "http://" + to_string(config[L"backend"][L"address"]) + ":" + to_string(config[L"backend"][L"port"].as_number().to_int32());
-        log("Starting backend on " + address);
+        host = to_string(config[L"backend"][L"address"]);
+        port = config[L"backend"][L"port"].as_number().to_int32();
+        log("Starting backend on " + host + ":" + to_string(port));
     }
     else
-        log("Error reading configuration file. Starting backend on " + address);
+        log("Error reading configuration file. Starting backend on " + host + ":" + to_string(port));
 
-    if (config.is_object() && config.has_object_field(L"authentication"))
+    if (!errorCode && config.is_object() && config.has_object_field(L"authentication"))
     {
-        if (config[L"authentication"].has_string_field(L"gameMasterPassword")) gameMasterPassword = to_string(config[L"authentication"][L"gameMasterPassword"]);
-        if (config[L"authentication"].has_string_field(L"blueCommanderPassword")) blueCommanderPassword = to_string(config[L"authentication"][L"blueCommanderPassword"]);
-        if (config[L"authentication"].has_string_field(L"redCommanderPassword")) redCommanderPassword = to_string(config[L"authentication"][L"redCommanderPassword"]);
+        auto& auth = config[L"authentication"];
+        if (auth.has_string_field(L"gameMasterPassword"))
+            gameMasterPassword = to_string(auth[L"gameMasterPassword"]);
+        if (auth.has_string_field(L"blueCommanderPassword"))
+            blueCommanderPassword = to_string(auth[L"blueCommanderPassword"]);
+        if (auth.has_string_field(L"redCommanderPassword"))
+            redCommanderPassword = to_string(auth[L"redCommanderPassword"]);
     }
     else
         log("Error reading configuration file. No password set.");
 
-    http_listener listener(to_wstring(address + "/" + REST_URI));
+    httplib::Server svr;
+    svr_ptr.store(&svr);
 
-    std::function<void(http_request)> handle_options = std::bind(&Server::handle_options, this, std::placeholders::_1);
-    std::function<void(http_request)> handle_get = std::bind(&Server::handle_get, this, std::placeholders::_1);
-    std::function<void(http_request)> handle_put = std::bind(&Server::handle_put, this, std::placeholders::_1);
+    svr.Options(R"(/olympus.*)", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_options(req, res);
+    });
+    svr.Get(R"(/olympus.*)", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_get(req, res);
+    });
+    svr.Put(R"(/olympus.*)", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_put(req, res);
+    });
 
-    listener.support(methods::OPTIONS, handle_options);
-    listener.support(methods::GET, handle_get);
-    listener.support(methods::PUT, handle_put);
+    log("RESTServer starting to listen on " + host + ":" + to_string(port));
+    svr.listen(host.c_str(), port);
+    log("RESTServer stopped listening");
 
-    try
-    {
-        listener.open()
-                .then([&listener]() {log("RESTServer starting to listen"); })
-                .wait();
-            
-        while (runListener) { Sleep(1000); };
-
-        listener.close()
-                .then([&listener]() {log("RESTServer stopping connections"); })
-                .wait();
-
-        log("RESTServer stopped listening");
-    }
-    catch (exception const& e)
-    {
-        log(e.what());
-    }
+    svr_ptr.store(nullptr);
 }

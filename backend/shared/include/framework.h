@@ -2,9 +2,15 @@
 
 #define DllExport   __declspec( dllexport )
 
-#define WIN32_LEAN_AND_MEAN             // Exclude rarely-used stuff from Windows headers
 // Windows Header Files
 #include <windows.h>
+
+// MinGW's winnt.h defines C_ASSERT(e) as "extern void __C_ASSERT__(...)" in C++ mode,
+// which fails inside template/class bodies (SafeInt3.hpp). Replace with static_assert.
+#ifdef C_ASSERT
+#undef C_ASSERT
+#endif
+#define C_ASSERT(e) static_assert(e, #e)
 
 #include <iostream>
 #include <string>
@@ -18,9 +24,12 @@
 #include <cstdarg>
 #include <filesystem>
 #include <codecvt>
-#include <cpprest/http_listener.h>
+#include <functional>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <sstream>
 #include <cpprest/json.h>
-#include <cpprest/streams.h>
 #include <set>
 
 using namespace std;

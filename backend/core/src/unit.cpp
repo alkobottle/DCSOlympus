@@ -111,7 +111,8 @@ void Unit::update(json::value json, double dt)
 				if (ammoJson[L"desc"].has_string_field(L"displayName")) {
 					string name = to_string(ammoJson[L"desc"][L"displayName"].as_string());
 					name = name.substr(0, min(name.size(), sizeof(ammoItem.name) - 1));
-					strcpy_s(ammoItem.name, sizeof(ammoItem.name), name.c_str());
+					strncpy(ammoItem.name, name.c_str(), sizeof(ammoItem.name) - 1);
+					ammoItem.name[sizeof(ammoItem.name) - 1] = '\0';
 				}
 
 				if (ammoJson[L"desc"].has_number_field(L"guidance"))

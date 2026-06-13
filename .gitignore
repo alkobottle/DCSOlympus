@@ -1,5 +1,13 @@
 bin
 .vs
+
+# MinGW Linux port — downloaded sources and build outputs
+third-party/GeographicLib-2.1.1/
+third-party/cpprestsdk/
+third-party/lua/liblua.a
+third-party/lua/lua.def
+mingw-deps/
+backend/build-mingw/
 x64
 Output
 node_modules

@@ -1,9 +1,29 @@
-#include "framework.h"
-#include "dcstools.h"
-#include "logger.h"
-#include "utils.h"
+/*
+ * olympus.cpp — thin loader DLL loaded by DCS via Lua C API.
+ *
+ * Intentionally has NO link-time dependencies on our other DLLs (logger, utils,
+ * dcstools, luatools). Wine does not propagate the "alternate file search path"
+ * (used when LoadLibrary is called with a full path) to transitive dependencies,
+ * so any import of e.g. dcstools.dll would fail because dcstools needs luatools.dll
+ * which is only in our bin/ directory, not on Wine's standard search path.
+ *
+ * The fix: this DLL imports only lua.dll + system DLLs (always available).
+ * luaopen_olympus calls SetDllDirectoryA(bin/) immediately, so the subsequent
+ * LoadLibraryW("core.dll") in onSimulationStart finds all its dependencies.
+ */
 
-/* Run-time linking to core dll allows for "hot swap". This is useful for development but could be removed when stable.*/
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+extern "C" {
+#include "lua.h"
+#include "lauxlib.h"
+}
+#include <string>
+
+#define DllExport __declspec(dllexport)
+
+// ── Runtime-linked core DLL ────────────────────────────────────────────────────
 HINSTANCE hGetProcIDDLL = NULL;
 typedef int(__stdcall* f_coreInit)(lua_State* L, const char* path);
 typedef int(__stdcall* f_coreDeinit)(lua_State* L);
@@ -22,115 +42,91 @@ f_coreMissionData coreMissionData = nullptr;
 f_coreDrawingsData coreDrawingsData = nullptr;
 f_coreSetExecutionResults coreExecutionResults = nullptr;
 
-string modPath;
+std::string modPath;
 
-//Returns the last Win32 error, in string format. Returns an empty string if there is no error.
-std::string GetLastErrorAsString()
-{
-    //Get the error message ID, if any.
-    DWORD errorMessageID = ::GetLastError();
-    if (errorMessageID == 0) {
-        return std::string(); //No error message has been recorded
-    }
+// ── Inline helpers (no external DLL deps) ─────────────────────────────────────
 
-    LPSTR messageBuffer = nullptr;
-
-    //Ask Win32 to give us the string version of that message ID.
-    //The parameters we pass in, tell Win32 to create the buffer that holds the message for us (because we don't yet know how long the message string will be).
-    size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, errorMessageID, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&messageBuffer, 0, NULL);
-
-    //Copy the error message into a std::string.
-    std::string message(messageBuffer, size);
-
-    //Free the Win32's string's buffer.
-    LocalFree(messageBuffer);
-
-    return message;
+static std::wstring to_wstring_local(const std::string& str) {
+    if (str.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
+    std::wstring ws(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &ws[0], n);
+    return ws;
 }
+
+static void Log(lua_State* L, const std::string& msg, const char* level_field) {
+    lua_getglobal(L, "log");
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    lua_getfield(L, -1, level_field);
+    int level = (int)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, -1, "write");
+    lua_remove(L, -2);
+    lua_pushstring(L, "Olympus.dll");
+    lua_pushnumber(L, level);
+    lua_pushstring(L, msg.c_str());
+    lua_pcall(L, 3, 0, 0);
+}
+
+static void LogInfo(lua_State* L, const std::string& msg) { Log(L, msg, "INFO"); }
+static void LogError(lua_State* L, const std::string& msg) { Log(L, msg, "ERROR"); }
+
+static std::string GetLastErrorAsString() {
+    DWORD id = ::GetLastError();
+    if (id == 0) return {};
+    LPSTR buf = nullptr;
+    size_t sz = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, id, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&buf, 0, NULL);
+    std::string msg(buf, sz);
+    LocalFree(buf);
+    return msg;
+}
+
+// ── Simulation callbacks ───────────────────────────────────────────────────────
 
 static int onSimulationStart(lua_State* L)
 {
     LogInfo(L, "Trying to load core.dll from " + modPath);
     SetDllDirectoryA(modPath.c_str());
 
-    setLogDirectory(modPath);
+    std::string dllLocation = modPath + "\\core.dll";
 
-    log("onSimulationStart callback called successfully");
-
-    string dllLocation = modPath + "\\core.dll";
-    
-    log("Loading core.dll");
-    hGetProcIDDLL = LoadLibrary(to_wstring(dllLocation).c_str());
-
+    hGetProcIDDLL = LoadLibraryW(to_wstring_local(dllLocation).c_str());
     if (!hGetProcIDDLL) {
-        LogError(L, "Error loading core DLL");
-        goto error;
+        LogError(L, "Error loading core DLL: " + GetLastErrorAsString());
+        return 0;
     }
 
-    log("Core DLL loaded successfully");
+    LogInfo(L, "Core DLL loaded successfully");
 
     coreInit = (f_coreInit)GetProcAddress(hGetProcIDDLL, "coreInit");
-    if (!coreInit) 
-    {
-        LogError(L, "Error getting coreInit ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreInit) { LogError(L, "Error getting coreInit ProcAddress"); goto error; }
 
     coreDeinit = (f_coreDeinit)GetProcAddress(hGetProcIDDLL, "coreDeinit");
-    if (!coreDeinit)
-    {
-        LogError(L, "Error getting coreDeinit ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreDeinit) { LogError(L, "Error getting coreDeinit ProcAddress"); goto error; }
 
     coreFrame = (f_coreFrame)GetProcAddress(hGetProcIDDLL, "coreFrame");
-    if (!coreFrame) 
-    {
-        LogError(L, "Error getting coreFrame ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreFrame) { LogError(L, "Error getting coreFrame ProcAddress"); goto error; }
 
     coreUnitsData = (f_coreUnitsData)GetProcAddress(hGetProcIDDLL, "coreUnitsData");
-    if (!coreUnitsData)
-    {
-        LogError(L, "Error getting coreUnitsData ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreUnitsData) { LogError(L, "Error getting coreUnitsData ProcAddress"); goto error; }
 
     coreWeaponsData = (f_coreWeaponsData)GetProcAddress(hGetProcIDDLL, "coreWeaponsData");
-    if (!coreWeaponsData)
-    {
-        LogError(L, "Error getting coreWeaponsData ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreWeaponsData) { LogError(L, "Error getting coreWeaponsData ProcAddress"); goto error; }
 
     coreMissionData = (f_coreMissionData)GetProcAddress(hGetProcIDDLL, "coreMissionData");
-    if (!coreMissionData)
-    {
-        LogError(L, "Error getting coreMissionData ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreMissionData) { LogError(L, "Error getting coreMissionData ProcAddress"); goto error; }
 
     coreDrawingsData = (f_coreDrawingsData)GetProcAddress(hGetProcIDDLL, "coreDrawingsData");
-    if (!coreDrawingsData)
-    {
-        LogError(L, "Error getting coreDrawingsData ProcAddress from DLL");
-        goto error;
-    }
+    if (!coreDrawingsData) { LogError(L, "Error getting coreDrawingsData ProcAddress"); goto error; }
 
-	coreExecutionResults = (f_coreSetExecutionResults)GetProcAddress(hGetProcIDDLL, "coreSetExecutionResults");
-    if (!coreExecutionResults)
-    {
-        LogError(L, "Error getting coreSetExecutionResults ProcAddress from DLL");
-        goto error;
-	}
+    coreExecutionResults = (f_coreSetExecutionResults)GetProcAddress(hGetProcIDDLL, "coreSetExecutionResults");
+    if (!coreExecutionResults) { LogError(L, "Error getting coreSetExecutionResults ProcAddress"); goto error; }
 
     coreInit(L, modPath.c_str());
-
     LogInfo(L, "Module loaded and started successfully.");
-
-	return 0;
+    return 0;
 
 error:
     LogError(L, "Error while loading module: " + GetLastErrorAsString());
@@ -139,140 +135,76 @@ error:
 
 static int onSimulationFrame(lua_State* L)
 {
-    if (coreFrame) 
-    {
-        coreFrame(L);
-    }
+    if (coreFrame) coreFrame(L);
     return 0;
 }
 
 static int onSimulationStop(lua_State* L)
 {
-    log("onSimulationStop callback called successfully");
-    if (hGetProcIDDLL)
-    {
-        log("Trying to unload core DLL");
-        if (coreDeinit)
-        {
-            coreDeinit(L);
-        }
-
+    if (hGetProcIDDLL) {
+        if (coreDeinit) coreDeinit(L);
         if (FreeLibrary(hGetProcIDDLL))
-        {
-            log("Core DLL unloaded successfully");
-        }
+            LogInfo(L, "Core DLL unloaded successfully");
         else
-        {
-            LogError(L, "Error unloading DLL");
-            goto error;
-        }
+            LogError(L, "Error unloading core DLL: " + GetLastErrorAsString());
 
-        coreInit = nullptr;
-        coreDeinit = nullptr;
-        coreFrame = nullptr;
-        coreUnitsData = nullptr;
-        coreWeaponsData = nullptr;
-        coreMissionData = nullptr;
-
-        coreDrawingsData = nullptr;
+        coreInit = nullptr; coreDeinit = nullptr; coreFrame = nullptr;
+        coreUnitsData = nullptr; coreWeaponsData = nullptr;
+        coreMissionData = nullptr; coreDrawingsData = nullptr;
+        coreExecutionResults = nullptr;
     }
-
     hGetProcIDDLL = NULL;
-
-    return 0;
-
-error:
-    LogError(L, "Error while unloading module: " + GetLastErrorAsString());
     return 0;
 }
 
-static int setUnitsData(lua_State* L)
-{
-    if (coreUnitsData)
-    {
-        coreUnitsData(L);
-    }
-    return 0;
-}
-
-static int setWeaponsData(lua_State* L)
-{
-    if (coreWeaponsData)
-    {
-        coreWeaponsData(L);
-    }
-    return 0;
-}
-
-static int setMissionData(lua_State* L)
-{
-    if (coreMissionData)
-    {
-        coreMissionData(L);
-    }
-    return 0;
-}
-
-static int setDrawingsData(lua_State* L)
-{
-    if (coreDrawingsData)
-    {
-        coreDrawingsData(L);
-    }
-    return 0;
-}
-
-static int setExecutionResults(lua_State* L)
-{
-    if (coreExecutionResults)
-    {
-        coreExecutionResults(L);
-    }
-    return 0;
-}
+static int setUnitsData(lua_State* L)    { if (coreUnitsData)    coreUnitsData(L);    return 0; }
+static int setWeaponsData(lua_State* L)  { if (coreWeaponsData)  coreWeaponsData(L);  return 0; }
+static int setMissionData(lua_State* L)  { if (coreMissionData)  coreMissionData(L);  return 0; }
+static int setDrawingsData(lua_State* L) { if (coreDrawingsData) coreDrawingsData(L); return 0; }
+static int setExecutionResults(lua_State* L) { if (coreExecutionResults) coreExecutionResults(L); return 0; }
 
 static const luaL_Reg Map[] = {
-	{"onSimulationStart", onSimulationStart},
-    {"onSimulationFrame", onSimulationFrame},
-    {"onSimulationStop", onSimulationStop},
-    {"setUnitsData", setUnitsData },
-    {"setWeaponsData", setWeaponsData },
-    {"setMissionData", setMissionData },
-    {"setDrawingsData", setDrawingsData },
-	{"setExecutionResults", setExecutionResults },
-	{NULL, NULL}
+    {"onSimulationStart",    onSimulationStart},
+    {"onSimulationFrame",    onSimulationFrame},
+    {"onSimulationStop",     onSimulationStop},
+    {"setUnitsData",         setUnitsData},
+    {"setWeaponsData",       setWeaponsData},
+    {"setMissionData",       setMissionData},
+    {"setDrawingsData",      setDrawingsData},
+    {"setExecutionResults",  setExecutionResults},
+    {NULL, NULL}
 };
 
-extern "C" DllExport int luaopen_olympus(lua_State * L)
+// ── DLL entry point loaded by DCS's Lua runtime ────────────────────────────────
+
+extern "C" DllExport int luaopen_olympus(lua_State* L)
 {
     lua_getglobal(L, "require");
     lua_pushstring(L, "lfs");
     lua_pcall(L, 1, 1, 0);
     lua_getfield(L, -1, "writedir");
     lua_pcall(L, 0, 1, 0);
+
     if (lua_isstring(L, -1)) {
-        modPath = string(lua_tostring(L, -1)) + "Mods\\Services\\Olympus\\bin\\";
+        modPath = std::string(lua_tostring(L, -1)) + "Mods\\Services\\Olympus\\bin\\";
+        // Set the DLL search path NOW so that core.dll's dependencies (logger, utils, …)
+        // are found in our bin/ directory when LoadLibraryW("core.dll") is called later.
         SetDllDirectoryA(modPath.c_str());
-        LogInfo(L, "Instance location retrieved successfully");
-    }
-    else {
-        /* Log without using the helper dlls because we have not loaded them yet here */
+        LogInfo(L, "Instance location retrieved: " + modPath);
+    } else {
+        // Fallback: log error via raw Lua API (no helper DLLs loaded yet)
         lua_getglobal(L, "log");
         lua_getfield(L, -1, "ERROR");
         int errorLevel = (int)lua_tointeger(L, -1);
-
         lua_getglobal(L, "log");
         lua_getfield(L, -1, "write");
         lua_pushstring(L, "Olympus.dll");
         lua_pushnumber(L, errorLevel);
-        lua_pushstring(L, "An error has occurred while trying to retrieve Olympus's instance location");
+        lua_pushstring(L, "Failed to retrieve Olympus instance location");
         lua_pcall(L, 3, 0, 0);
-
         return 0;
     }
 
-    LogInfo(L, "Loading .dlls from " + modPath);
-
-	luaL_register(L, "olympus", Map);
-	return 1;
+    luaL_register(L, "olympus", Map);
+    return 1;
 }

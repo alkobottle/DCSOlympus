@@ -1,4 +1,4 @@
-#include "scriptLoader.h"
+#include "scriptloader.h"
 #include "logger.h"
 #include "luatools.h"
 #include "dcstools.h"
