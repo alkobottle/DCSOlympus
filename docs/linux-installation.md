@@ -295,28 +295,87 @@ sudo htpasswd -c /etc/nginx/.olympus_htpasswd <username>
 
 ---
 
-## 6 — DCS server startup
+## 6 — Starting the server
 
-Start DCS under Wine as the service user:
+### What starts automatically on boot
 
-```bash
-WINEPREFIX=/home/dcs/.wine DISPLAY=:1 \
-    wine /home/dcs/.wine/drive_c/DCS_server/bin/DCS_server.exe -w <InstanceName>
-```
+The following services are managed by systemd and start on boot without
+intervention:
 
-A typical wrapper script (`/home/dcs/bin/dcs-server-start.sh`):
+| Service | What it does |
+|---|---|
+| `tigervnc@1.service` | Virtual display `:1` — Wine requires this |
+| `novnc@dcs.service` | noVNC web proxy — browser-based VNC access |
+| `nginx` | Reverse proxy / TLS termination |
+
+### What requires a manual start
+
+DCS and the Olympus frontend server are started together with a single script.
+The script starts the Olympus frontend in the background, then starts DCS in
+the foreground. When DCS exits, the frontend is shut down automatically via a
+trap.
+
+**`/home/dcs/bin/dcs-server-start.sh`:**
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+
+mkdir -p /home/dcs/logs
+
+cleanup() {
+    echo "[startup] Shutting down..."
+    kill "$frontend_pid" 2>/dev/null || true
+    kill "$dcs_pid" 2>/dev/null || true
+    wait
+}
+trap cleanup EXIT INT TERM
+
+# Olympus frontend server
+node /home/dcs/DCSOlympus/frontend/server/build/www.js \
+    -c "/home/dcs/.wine/drive_c/users/dcs/Saved Games/<InstanceName>/Config/olympus.json" \
+    >>/home/dcs/logs/olympus-frontend.log 2>&1 &
+frontend_pid=$!
+echo "[startup] Olympus frontend PID $frontend_pid"
+
+# DCS dedicated server under Wine
 export WINEPREFIX="/home/dcs/.wine"
 export DISPLAY="${DISPLAY:-:1}"
 cd "/home/dcs/.wine/drive_c/DCS_server/bin"
-exec wine DCS_server.exe -w <InstanceName>
+wine DCS_server.exe -w <InstanceName> &
+dcs_pid=$!
+echo "[startup] DCS PID $dcs_pid"
+
+wait "$dcs_pid"
 ```
 
-When DCS loads a mission, watch for these log lines confirming Olympus is up
-(`Saved Games/<InstanceName>/Logs/dcs.log`):
+### Running the script
+
+The typical workflow is to connect via the noVNC web interface (served by
+`novnc@dcs.service`) as the `dcs` user, open a terminal, and run:
+
+```bash
+/home/dcs/bin/dcs-server-start.sh
+```
+
+To run it in the background so it survives closing the terminal:
+
+```bash
+screen -dmS dcs /home/dcs/bin/dcs-server-start.sh
+# Reattach later with:
+screen -r dcs
+```
+
+### Log locations
+
+| Log | Path |
+|---|---|
+| DCS server | `Saved Games/<InstanceName>/Logs/dcs.log` |
+| Olympus frontend | `/home/dcs/logs/olympus-frontend.log` |
+
+### Confirming Olympus is up
+
+When DCS loads a mission, watch `dcs.log` for:
 
 ```
 INFO  Olympus.HOOKS.LUA: Olympus vX.X.X C++ module callbacks registered correctly.
@@ -325,8 +384,9 @@ INFO  SCRIPTING: OlympusCommand script ... loaded successfully
 INFO  Dispatcher: loadMission Done: Control passed to the player
 ```
 
-The backend REST API will be available on port 3001 once `loadMission Done`
-appears.
+The backend REST API is available on port 3001 once `loadMission Done` appears.
+Units will appear on the map shortly after as the Lua timers populate the unit
+table.
 
 ---
 
